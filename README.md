@@ -11,4 +11,4 @@ Instead of downloading it, you can also use the [online book generator](https://
 
 There are separate (older) versions based on specialized variant forks, such as [official Stockfish](https://github.com/fairy-stockfish/bookgen/tree/official-stockfish), [multi-variant Stockfish](https://github.com/fairy-stockfish/bookgen/tree/multivariant), [Seirawan-Stockfish](https://github.com/fairy-stockfish/bookgen/tree/seirawan), [Shatranj-Stockfish](https://github.com/fairy-stockfish/bookgen/tree/shatranj), and [Makruk-Stockfish](https://github.com/fairy-stockfish/bookgen/tree/makruk) that can be found on the respective branches, but the Fairy-Stockfish based version supports all of these variants as well.
 
-Also see the [Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish) repository for more info.
+Also see the [Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish) repository for more info
