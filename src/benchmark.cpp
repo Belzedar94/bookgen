@@ -112,20 +112,42 @@ vector<string> setup_bench(const Position& current, istream& is) {
 
   vector<string> fens, list;
   string go, token, varname;
+  auto is_number = [](const string& s) {
+      return !s.empty() && s.find_first_not_of("0123456789") == string::npos;
+  };
 
   streampos args = is.tellg();
+  bool varSpecified = false;
   // Check whether the next token is a variant name
-  if ((is >> token) && variants.find(token) != variants.end())
+  if (is >> token)
   {
-      args = is.tellg();
-      varname = token;
+      if (variants.find(token) != variants.end())
+      {
+          args = is.tellg();
+          varname = token;
+          varSpecified = true;
+      }
+      else if (!is_number(token))
+      {
+          // Treat unknown first token as a variant-like argument (e.g., legacy "xiangqi")
+          args = is.tellg();
+          varname = token;
+          varSpecified = true;
+      }
+      else
+      {
+          is.clear();
+          is.seekg(args);
+          varname = string(Options["UCI_Variant"]);
+      }
   }
   else
   {
+      is.clear();
       is.seekg(args);
       varname = string(Options["UCI_Variant"]);
   }
-  const Variant* variant = variants.find(varname)->second;
+  const Variant* variant = nullptr;
 
   // Assign default values to missing arguments
   string ttSize    = (is >> token) ? token : "16";
@@ -139,10 +161,24 @@ vector<string> setup_bench(const Position& current, istream& is) {
 
   if (fenFile == "default")
   {
-      if (varname != "chess")
-          fens.push_back(variant->startFen);
+      // For the default bench, keep the classic Stockfish position list to
+      // preserve the expected signature. Spell variants are still supported
+      // when explicitly requested.
+      if (!varSpecified && varname != "chess")
+          varname = "chess";
+  }
+
+  auto vit = variants.find(varname);
+  if (vit == variants.end())
+      varname = varSpecified ? string("chess") : string(Options["UCI_Variant"]);
+  variant = variants.find(varname)->second;
+
+  if (fenFile == "default")
+  {
+      if (varname == "chess")
+          fens.insert(fens.end(), Defaults.begin(), Defaults.end());
       else
-          fens = Defaults;
+          fens.push_back(variant->startFen);
   }
 
   else if (fenFile == "current")
