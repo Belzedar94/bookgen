@@ -27,7 +27,6 @@
 #include "misc.h"
 #include "movegen.h"
 #include "movepick.h"
-#include "partner.h"
 #include "position.h"
 #include "search.h"
 #include "thread.h"
@@ -35,7 +34,6 @@
 #include "tt.h"
 #include "uci.h"
 #include "xboard.h"
-#include "syzygy/tbprobe.h"
 
 namespace Stockfish {
 
@@ -44,15 +42,6 @@ namespace Search {
   LimitsType Limits;
 }
 
-namespace Tablebases {
-
-  int Cardinality;
-  bool RootInTB;
-  bool UseRule50;
-  Depth ProbeDepth;
-}
-
-namespace TB = Tablebases;
 
 using std::string;
 using Eval::evaluate;
@@ -88,21 +77,73 @@ namespace {
     return d > 14 ? 73 : 6 * d * d + 229 * d - 215;
   }
 
+  Variant::PotionType potion_type_from_gating_piece(const Position& pos, PieceType gatingPiece) {
+    for (int idx = 0; idx < Variant::POTION_TYPE_NB; ++idx)
+    {
+        auto potion = static_cast<Variant::PotionType>(idx);
+        if (pos.potion_piece(potion) == gatingPiece)
+            return potion;
+    }
+    return Variant::POTION_TYPE_NB;
+  }
+
+  bool is_potion_gating_move(const Position& pos, Move m) {
+
+    if (!pos.potions_enabled() || !is_gating(m))
+        return false;
+
+    return potion_type_from_gating_piece(pos, gating_type(m)) != Variant::POTION_TYPE_NB;
+  }
+
+  bool is_tactical_potion(const Position& pos, Move m, Bitboard ourRoyalAttackers, Square enemyRoyal, Square ourRoyal) {
+
+    if (!pos.potions_enabled() || !is_gating(m))
+        return false;
+
+    Variant::PotionType potion = potion_type_from_gating_piece(pos, gating_type(m));
+    if (potion != Variant::POTION_FREEZE)
+        return false;
+
+    Color us = pos.side_to_move();
+    Color them = ~us;
+    Bitboard zone = pos.freeze_zone_from_square(gating_square(m));
+    if (enemyRoyal != SQ_NONE && (zone & square_bb(enemyRoyal)))
+        return true;
+
+    if (ourRoyalAttackers && (zone & ourRoyalAttackers))
+        return true;
+
+    Bitboard candidates = zone & pos.pieces(them);
+    if (!candidates)
+        return false;
+
+    const Value majorThreshold = PieceValue[MG][make_piece(WHITE, ROOK)];
+    Bitboard occ = pos.pieces();
+    while (candidates)
+    {
+        Square s = pop_lsb(candidates);
+        Piece pc = pos.piece_on(s);
+        PieceType pt = type_of(pc);
+        if (pt == NO_PIECE_TYPE)
+            continue;
+
+        // Freezing an attacked or major enemy piece is a tactical motif in spell-chess.
+        if (PieceValue[MG][pc] >= majorThreshold)
+            return true;
+        if (pos.attackers_to(s, us))
+            return true;
+
+        if (ourRoyal != SQ_NONE && (attacks_bb(them, pt, s, occ) & square_bb(ourRoyal)))
+            return true;
+    }
+
+    return false;
+  }
+
   // Add a small random component to draw evaluations to avoid 3-fold blindness
   Value value_draw(Thread* thisThread) {
     return VALUE_DRAW + Value(2 * (thisThread->nodes & 1) - 1);
   }
-
-  // Skill structure is used to implement strength limit
-  struct Skill {
-    explicit Skill(int l) : level(l) {}
-    bool enabled() const { return level < 20; }
-    bool time_to_pick(Depth depth) const { return depth == 1 + std::max(level, 0); }
-    Move pick_best(size_t multiPV);
-
-    int level;
-    Move best = MOVE_NONE;
-  };
 
   template <NodeType nodeType>
   Value search(Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode);
@@ -168,7 +209,6 @@ void Search::clear() {
   Time.availableNodes = 0;
   TT.clear();
   Threads.clear();
-  Tablebases::init(Options["SyzygyPath"]); // Free mapped files
 }
 
 
@@ -219,13 +259,6 @@ void MainThread::search() {
       Thread::search();          // main thread start searching
   }
 
-  // Sit in bughouse variants if partner requested it or we are dead
-  if (rootPos.two_boards() && !Threads.abort && CurrentProtocol == XBOARD)
-  {
-      while (!Threads.stop && (Partner.sitRequested || (Partner.weDead && !Partner.partnerDead)) && Time.elapsed() < Limits.time[us] - 1000)
-      {}
-  }
-
   // When we reach the maximum depth, we can arrive here without a raise of
   // Threads.stop. However, if we are pondering or in an infinite search,
   // the UCI protocol states that we shouldn't print the best move before the
@@ -251,7 +284,6 @@ void MainThread::search() {
 
   if (   int(Options["MultiPV"]) == 1
       && !Limits.depth
-      && !(Skill(Options["Skill Level"]).enabled() || int(Options["UCI_LimitStrength"]))
       && rootMoves[0].pv[0] != MOVE_NONE)
       bestThread = Threads.get_best_thread();
 
@@ -264,21 +296,6 @@ void MainThread::search() {
   if (CurrentProtocol == XBOARD)
   {
       Move bestMove = bestThread->rootMoves[0].pv[0];
-      // Wait for virtual drop to become real
-      if (rootPos.two_boards() && rootPos.virtual_drop(bestMove))
-      {
-          Partner.ptell("fast");
-          while (!Threads.abort && !Partner.partnerDead && !Partner.fast && Limits.time[us] - Time.elapsed() > Partner.opptime)
-          {}
-          Partner.ptell("x");
-          // Find best real move
-          for (const auto& m : this->rootMoves)
-              if (!rootPos.virtual_drop(m.pv[0]))
-              {
-                  bestMove = m.pv[0];
-                  break;
-              }
-      }
       // Send move only when not in analyze mode and not at game end
       if (!Limits.infinite && !ponder && rootMoves[0].pv[0] != MOVE_NONE && !Threads.abort.exchange(true))
       {
@@ -357,27 +374,6 @@ void Thread::search() {
   std::fill(&lowPlyHistory[MAX_LPH - 2][0], &lowPlyHistory.back().back() + 1, 0);
 
   size_t multiPV = size_t(Options["MultiPV"]);
-
-  // Pick integer skill levels, but non-deterministically round up or down
-  // such that the average integer skill corresponds to the input floating point one.
-  // UCI_Elo is converted to a suitable fractional skill level, using anchoring
-  // to CCRL Elo (goldfish 1.13 = 2000) and a fit through Ordo derived Elo
-  // for match (TC 60+0.6) results spanning a wide range of k values.
-  PRNG rng(now());
-  double shiftedElo = Options["UCI_Elo"] - 1346.6;
-  double floatLevel = Options["UCI_LimitStrength"] ?
-                      std::clamp(shiftedElo > 0 ? std::pow(shiftedElo / 143.4, 1 / 0.806)
-                                                : shiftedElo / 143.4 + std::pow(shiftedElo / 500, 5),
-                                 -20.0, 20.0) :
-                        double(Options["Skill Level"]);
-  int intLevel = int(floatLevel) +
-                 ((floatLevel - int(floatLevel)) * 1024 > rng.rand<unsigned>() % 1024  ? 1 : 0);
-  Skill skill(intLevel);
-
-  // When playing with strength handicap enable MultiPV search that we will
-  // use behind the scenes to retrieve a set of possible moves.
-  if (skill.enabled())
-      multiPV = std::max(multiPV, (size_t)4);
 
   multiPV = std::min(multiPV, rootMoves.size());
   ttHitAverage = TtHitAverageWindow * TtHitAverageResolution / 2;
@@ -515,10 +511,6 @@ void Thread::search() {
       if (!mainThread)
           continue;
 
-      // If skill level is enabled and time is up, pick a sub-optimal best move
-      if (skill.enabled() && skill.time_to_pick(rootDepth))
-          skill.pick_best(multiPV);
-
       // Do we have time for the next iteration? Can we stop searching now?
       if (    Limits.use_time_management()
           && !Threads.stop
@@ -547,73 +539,6 @@ void Thread::search() {
           if (rootMoves.size() == 1)
               totalTime = std::min(500.0, totalTime);
 
-          // Update partner in bughouse variants
-          if (completedDepth >= 8 && rootPos.two_boards() && CurrentProtocol == XBOARD)
-          {
-              // Communicate clock times relevant for sitting decisions
-              if (Limits.time[us])
-                  Partner.ptell<FAIRY>("time " + std::to_string((Limits.time[us] - Time.elapsed()) / 10));
-              if (Limits.time[~us])
-                  Partner.ptell<FAIRY>("otim " + std::to_string(Limits.time[~us] / 10));
-              // We are dead and need to sit
-              if (!Partner.weDead && bestValue <= VALUE_MATED_IN_MAX_PLY)
-              {
-                  Partner.ptell("dead");
-                  Partner.weDead = true;
-              }
-              // We were dead but are fine again
-              else if (Partner.weDead && bestValue > VALUE_MATED_IN_MAX_PLY)
-              {
-                  Partner.ptell("x");
-                  Partner.weDead = false;
-              }
-              // We win by force, so partner should sit
-              else if (!Partner.weWin && bestValue >= VALUE_MATE_IN_MAX_PLY && Limits.time[~us] < Partner.time)
-              {
-                  Partner.ptell("sit");
-                  Partner.weWin = true;
-              }
-              // We are no longer winning
-              else if (Partner.weWin && (bestValue < VALUE_MATE_IN_MAX_PLY || Limits.time[~us] > Partner.time))
-              {
-                  Partner.ptell("x");
-                  Partner.weWin = false;
-              }
-              // We can win if partner delivers required material quickly
-              else if (  !Partner.weVirtualWin
-                       && bestValue >= VALUE_VIRTUAL_MATE_IN_MAX_PLY
-                       && bestValue <= VALUE_VIRTUAL_MATE
-                       && Limits.time[us] - Time.elapsed() > Partner.opptime)
-              {
-                  Partner.ptell("fast");
-                  Partner.weVirtualWin = true;
-              }
-              // Virtual mate is gone
-              else if (   Partner.weVirtualWin
-                       && (bestValue < VALUE_VIRTUAL_MATE_IN_MAX_PLY || bestValue > VALUE_VIRTUAL_MATE || Limits.time[us] - Time.elapsed() < Partner.opptime))
-              {
-                  Partner.ptell("slow");
-                  Partner.weVirtualWin = false;
-              }
-              // We need to survive a virtual mate and play fast
-              else if (  !Partner.weVirtualLoss
-                       && (bestValue <= -VALUE_VIRTUAL_MATE_IN_MAX_PLY && bestValue >= -VALUE_VIRTUAL_MATE)
-                       && Limits.time[~us] > Partner.time)
-              {
-                  Partner.ptell("sit");
-                  Partner.weVirtualLoss = true;
-                  Partner.fast = true;
-              }
-              // Virtual mate threat is over
-              else if (   Partner.weVirtualLoss
-                       && (bestValue > -VALUE_VIRTUAL_MATE_IN_MAX_PLY || bestValue < -VALUE_VIRTUAL_MATE || Limits.time[~us] < Partner.time))
-              {
-                  Partner.ptell("x");
-                  Partner.weVirtualLoss = false;
-                  Partner.fast = false;
-              }
-          }
-
           // Stop the search if we have exceeded the totalTime
           if (Time.elapsed() > totalTime)
           {
@@ -621,7 +546,7 @@ void Thread::search() {
               // keep pondering until the GUI sends "ponderhit" or "stop".
               if (mainThread->ponder)
                   mainThread->stopOnPonderhit = true;
-              else if (!(rootPos.two_boards() && (Partner.sitRequested || Partner.weDead)))
+              else
                   Threads.stop = true;
           }
           else if (   Threads.increaseDepth
@@ -641,10 +566,6 @@ void Thread::search() {
 
   mainThread->previousTimeReduction = timeReduction;
 
-  // If skill level is enabled, swap best PV line with the sub-optimal one
-  if (skill.enabled())
-      std::swap(rootMoves[0], *std::find(rootMoves.begin(), rootMoves.end(),
-                skill.best ? skill.best : skill.pick_best(multiPV)));
 }
 
 
@@ -697,12 +618,26 @@ namespace {
 
     // Step 1. Initialize node
     Thread* thisThread = pos.this_thread();
-    ss->inCheck        = pos.checkers();
+    ss->inCheck        = pos.checkers() && !pos.allow_self_check();
     priorCapture       = pos.captured_piece();
     Color us           = pos.side_to_move();
     moveCount          = captureCount = quietCount = ss->moveCount = 0;
     bestValue          = -VALUE_INFINITE;
     maxValue           = VALUE_INFINITE;
+    Bitboard ourRoyalAttackers = 0;
+    Square enemyRoyal = SQ_NONE;
+    Square ourRoyal = SQ_NONE;
+    if (pos.potions_enabled())
+    {
+        PieceType royal = pos.royal_piece_type();
+        if (pos.count(us, royal))
+        {
+            ourRoyal = pos.square(us, royal);
+            ourRoyalAttackers = pos.attackers_to(ourRoyal, ~us);
+        }
+        if (pos.count(~us, royal))
+            enemyRoyal = pos.square(~us, royal);
+    }
 
     // Check for the available remaining time
     if (thisThread == Threads.main())
@@ -814,59 +749,6 @@ namespace {
             return ttValue;
     }
 
-    // Step 5. Tablebases probe
-    if (!rootNode && TB::Cardinality)
-    {
-        int piecesCount = pos.count<ALL_PIECES>();
-
-        if (    piecesCount <= TB::Cardinality
-            && (piecesCount <  TB::Cardinality || depth >= TB::ProbeDepth)
-            &&  pos.rule50_count() == 0
-            &&  Options["UCI_Variant"] == "chess"
-            && !pos.can_castle(ANY_CASTLING))
-        {
-            TB::ProbeState err;
-            TB::WDLScore wdl = Tablebases::probe_wdl(pos, &err);
-
-            // Force check of time on the next occasion
-            if (thisThread == Threads.main())
-                static_cast<MainThread*>(thisThread)->callsCnt = 0;
-
-            if (err != TB::ProbeState::FAIL)
-            {
-                thisThread->tbHits.fetch_add(1, std::memory_order_relaxed);
-
-                int drawScore = TB::UseRule50 ? 1 : 0;
-
-                // use the range VALUE_MATE_IN_MAX_PLY to VALUE_TB_WIN_IN_MAX_PLY to score
-                value =  wdl < -drawScore ? VALUE_MATED_IN_MAX_PLY + ss->ply + 1
-                       : wdl >  drawScore ? VALUE_MATE_IN_MAX_PLY - ss->ply - 1
-                                          : VALUE_DRAW + 2 * wdl * drawScore;
-
-                Bound b =  wdl < -drawScore ? BOUND_UPPER
-                         : wdl >  drawScore ? BOUND_LOWER : BOUND_EXACT;
-
-                if (    b == BOUND_EXACT
-                    || (b == BOUND_LOWER ? value >= beta : value <= alpha))
-                {
-                    tte->save(posKey, value_to_tt(value, ss->ply), ss->ttPv, b,
-                              std::min(MAX_PLY - 1, depth + 6),
-                              MOVE_NONE, VALUE_NONE);
-
-                    return value;
-                }
-
-                if (PvNode)
-                {
-                    if (b == BOUND_LOWER)
-                        bestValue = value, alpha = std::max(alpha, bestValue);
-                    else
-                        maxValue = value;
-                }
-            }
-        }
-    }
-
     CapturePieceToHistory& captureHistory = thisThread->captureHistory;
 
     // Step 6. Static evaluation of the position
@@ -927,6 +809,7 @@ namespace {
 
     // Step 7. Futility pruning: child node (~50 Elo)
     if (   !PvNode
+        && !ss->inCheck
         &&  depth < 9 - 3 * pos.blast_on_capture()
         &&  eval - futility_margin(depth, improving) * (1 + pos.check_counting() + 2 * pos.must_capture() + pos.extinction_single_piece() + !pos.checking_permitted()) >= beta
         &&  eval < VALUE_KNOWN_WIN) // Do not return unproven wins
@@ -934,6 +817,7 @@ namespace {
 
     // Step 8. Null move search with verification search (~40 Elo)
     if (   !PvNode
+        && !ss->inCheck
         && (ss-1)->currentMove != MOVE_NULL
         && (ss-1)->statScore < 23767
         &&  eval >= beta
@@ -1100,7 +984,6 @@ moves_loop: // When in check, search starts from here
                          && ttMove
                          && (tte->bound() & BOUND_UPPER)
                          && tte->depth() >= depth;
-
     // Step 12. Loop through all pseudo-legal moves until no moves remain
     // or a beta cutoff occurs.
     while ((move = mp.next_move(moveCountPruning)) != MOVE_NONE)
@@ -1135,6 +1018,7 @@ moves_loop: // When in check, search starts from here
       captureOrPromotion = pos.capture_or_promotion(move);
       movedPiece = pos.moved_piece(move);
       givesCheck = pos.gives_check(move);
+      const bool tacticalPotion = is_tactical_potion(pos, move, ourRoyalAttackers, enemyRoyal, ourRoyal);
 
       // Calculate new depth for this move
       newDepth = depth - 1;
@@ -1153,12 +1037,13 @@ moves_loop: // When in check, search starts from here
           if (pos.must_capture() && pos.attackers_to(to_sq(move), ~us))
           {}
           else
-
           if (   captureOrPromotion
-              || givesCheck)
+              || givesCheck
+              || tacticalPotion)
           {
               // Capture history based pruning when the move doesn't give check
               if (   !givesCheck
+                  && !tacticalPotion
                   && lmrDepth < 1
                   && captureHistory[movedPiece][to_sq(move)][type_of(pos.piece_on(to_sq(move)))] < 0)
                   continue;
@@ -1167,7 +1052,7 @@ moves_loop: // When in check, search starts from here
               if (!pos.see_ge(move, Value(-218 - 120 * pos.captures_to_hand()) * depth)) // (~25 Elo)
                   continue;
           }
-          else
+          else if (!tacticalPotion)
           {
               // Continuation history based pruning (~20 Elo)
               if (   lmrDepth < 5
@@ -1250,7 +1135,7 @@ moves_loop: // When in check, search starts from here
                   return beta;
           }
       }
-      else if (   givesCheck
+      else if (   (givesCheck || tacticalPotion)
                && depth > 6
                && abs(ss->staticEval) > Value(100))
           extension = 1;
@@ -1263,6 +1148,13 @@ moves_loop: // When in check, search starts from here
 
       // Add extension to new depth
       newDepth += extension;
+      if (is_potion_gating_move(pos, move) && depth >= 3)
+      {
+          int penalty = (givesCheck || captureOrPromotion || tacticalPotion) ? 1 : 2;
+          if (tacticalPotion)
+              penalty = 0; // Tactical potion moves behave like regular tactics.
+          newDepth = std::max(newDepth - penalty, 0);
+      }
       ss->doubleExtensions = (ss-1)->doubleExtensions + (extension == 2);
 
       // Speculative prefetch as early as possible
@@ -1318,9 +1210,9 @@ moves_loop: // When in check, search starts from here
 
           // Increase reduction for cut nodes (~3 Elo)
           if (cutNode)
-              r += 1 + !captureOrPromotion;
+              r += 1 + (!captureOrPromotion && !tacticalPotion);
 
-          if (!captureOrPromotion)
+          if (!captureOrPromotion && !tacticalPotion)
           {
               // Increase reduction if ttMove is a capture (~3 Elo)
               if (ttCapture)
@@ -1337,6 +1229,8 @@ moves_loop: // When in check, search starts from here
               if (!ss->inCheck)
                   r -= ss->statScore / (14721 - 4434 * pos.captures_to_hand());
           }
+          else if (tacticalPotion)
+              r -= 1;
 
           // In general we want to cap the LMR depth search at newDepth. But if
           // reductions are really negative and movecount is low, we allow this move
@@ -1543,7 +1437,7 @@ moves_loop: // When in check, search starts from here
 
     Thread* thisThread = pos.this_thread();
     bestMove = MOVE_NONE;
-    ss->inCheck = pos.checkers();
+    ss->inCheck = pos.checkers() && !pos.allow_self_check();
     moveCount = 0;
 
     Value gameResult;
@@ -1913,39 +1807,6 @@ moves_loop: // When in check, search starts from here
         thisThread->lowPlyHistory[ss->ply][from_to(move)] << stat_bonus(depth - 7);
   }
 
-  // When playing with strength handicap, choose best move among a set of RootMoves
-  // using a statistical rule dependent on 'level'. Idea by Heinz van Saanen.
-
-  Move Skill::pick_best(size_t multiPV) {
-
-    const RootMoves& rootMoves = Threads.main()->rootMoves;
-    static PRNG rng(now()); // PRNG sequence should be non-deterministic
-
-    // RootMoves are already sorted by score in descending order
-    Value topScore = rootMoves[0].score;
-    int delta = std::min(topScore - rootMoves[multiPV - 1].score, PawnValueMg);
-    int weakness = 120 - 2 * level;
-    int maxScore = -VALUE_INFINITE;
-
-    // Choose best move. For each move score we add two terms, both dependent on
-    // weakness. One is deterministic and bigger for weaker levels, and one is
-    // random. Then we choose the move with the resulting highest score.
-    for (size_t i = 0; i < multiPV; ++i)
-    {
-        // This is our magic formula
-        int push = (  weakness * int(topScore - rootMoves[i].score)
-                    + delta * (rng.rand<unsigned>() % weakness)) / 128;
-
-        if (rootMoves[i].score + push >= maxScore)
-        {
-            maxScore = rootMoves[i].score + push;
-            best = rootMoves[i].pv[0];
-        }
-    }
-
-    return best;
-  }
-
 } // namespace
 
 
@@ -1975,11 +1836,6 @@ void MainThread::check_time() {
   if (ponder)
       return;
 
-  if (   rootPos.two_boards()
-      && Time.elapsed() < Limits.time[rootPos.side_to_move()] - 1000
-      && (Partner.sitRequested || (Partner.weDead && !Partner.partnerDead) || Partner.weVirtualWin))
-      return;
-
   if (   (Limits.use_time_management() && (elapsed > Time.maximum() - 10 || stopOnPonderhit))
       || (Limits.movetime && elapsed >= Limits.movetime)
       || (Limits.nodes && Threads.nodes_searched() >= (uint64_t)Limits.nodes))
@@ -1998,7 +1854,7 @@ string UCI::pv(const Position& pos, Depth depth, Value alpha, Value beta) {
   size_t pvIdx = pos.this_thread()->pvIdx;
   size_t multiPV = std::min((size_t)Options["MultiPV"], rootMoves.size());
   uint64_t nodesSearched = Threads.nodes_searched();
-  uint64_t tbHits = Threads.tb_hits() + (TB::RootInTB ? rootMoves.size() : 0);
+  uint64_t tbHits = Threads.tb_hits();
 
   for (size_t i = 0; i < multiPV; ++i)
   {
@@ -2013,8 +1869,6 @@ string UCI::pv(const Position& pos, Depth depth, Value alpha, Value beta) {
       if (v == -VALUE_INFINITE)
           v = VALUE_ZERO;
 
-      bool tb = TB::RootInTB && abs(v) < VALUE_MATE_IN_MAX_PLY;
-      v = tb ? rootMoves[i].tbScore : v;
 
       if (ss.rdbuf()->in_avail()) // Not at first line
           ss << "\n";
@@ -2045,7 +1899,7 @@ string UCI::pv(const Position& pos, Depth depth, Value alpha, Value beta) {
       if (Options["UCI_ShowWDL"])
           ss << UCI::wdl(v, pos.game_ply());
 
-      if (!tb && i == pvIdx)
+      if (i == pvIdx)
           ss << (v >= beta ? " lowerbound" : v <= alpha ? " upperbound" : "");
 
       ss << " nodes "    << nodesSearched
@@ -2096,53 +1950,6 @@ bool RootMove::extract_ponder_from_tt(Position& pos) {
 
     pos.undo_move(pv[0]);
     return pv.size() > 1;
-}
-
-void Tablebases::rank_root_moves(Position& pos, Search::RootMoves& rootMoves) {
-
-    RootInTB = false;
-    UseRule50 = bool(Options["Syzygy50MoveRule"]);
-    ProbeDepth = int(Options["SyzygyProbeDepth"]);
-    Cardinality = int(Options["SyzygyProbeLimit"]);
-    bool dtz_available = true;
-
-    // Tables with fewer pieces than SyzygyProbeLimit are searched with
-    // ProbeDepth == DEPTH_ZERO
-    if (Cardinality > MaxCardinality)
-    {
-        Cardinality = MaxCardinality;
-        ProbeDepth = 0;
-    }
-
-    if (Cardinality >= popcount(pos.pieces()) && !pos.can_castle(ANY_CASTLING))
-    {
-        // Rank moves using DTZ tables
-        RootInTB = root_probe(pos, rootMoves);
-
-        if (!RootInTB)
-        {
-            // DTZ tables are missing; try to rank moves using WDL tables
-            dtz_available = false;
-            RootInTB = root_probe_wdl(pos, rootMoves);
-        }
-    }
-
-    if (RootInTB)
-    {
-        // Sort moves according to TB rank
-        std::stable_sort(rootMoves.begin(), rootMoves.end(),
-                  [](const RootMove &a, const RootMove &b) { return a.tbRank > b.tbRank; } );
-
-        // Probe during search only if DTZ is not available and we are winning
-        if (dtz_available || rootMoves[0].tbScore <= VALUE_DRAW)
-            Cardinality = 0;
-    }
-    else
-    {
-        // Clean up if root_probe() and root_probe_wdl() have failed
-        for (auto& m : rootMoves)
-            m.tbRank = 0;
-    }
 }
 
 } // namespace Stockfish

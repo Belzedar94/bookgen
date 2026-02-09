@@ -20,6 +20,8 @@
 #define MOVEGEN_H_INCLUDED
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 #include "types.h"
 
@@ -54,6 +56,9 @@ inline bool operator<(const ExtMove& f, const ExtMove& s) {
 
 template<GenType>
 ExtMove* generate(const Position& pos, ExtMove* moveList);
+
+ExtMove* generate_base(GenType Type, const Position& pos, ExtMove* moveList);
+ExtMove* generate_potions(GenType Type, const Position& pos, ExtMove* baseStart, ExtMove* baseEnd);
 
 constexpr size_t moveListSize = sizeof(ExtMove) * MAX_MOVES;
 
